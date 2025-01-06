@@ -5,7 +5,7 @@ from rich.console import Console
 from rich.progress import Progress, ProgressColumn, GetTimeCallable, TaskID
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import warnings
-from typing import List, Dict, Tuple, Optional, Union, Literal, Hashable, Callable, Sequence, Any, TypeVar
+from typing import List, Dict, Tuple, Optional, Union, Literal, Hashable, Callable, Sequence, Any, FrozenSet
 
 # runtime state
 NOT_BEGIN = -1
@@ -214,7 +214,7 @@ class TaskGroup(BaseTask):
         return self.tasks
     
     @property
-    def CacheVars(self) -> frozenset:
+    def CacheVars(self) -> FrozenSet[str]:
         return self.cache_vars
     
     @property
@@ -256,7 +256,7 @@ class TaskMap():
         return self.nodes
     
     @property
-    def CacheVars(self) -> frozenset:
+    def CacheVars(self) -> FrozenSet[str]:
         return self.cache_vars
         
     def __len__(self) -> int:
@@ -379,22 +379,30 @@ class TaskStateMachine():
         'use_progress': True,
         'keep_worker_silent': False,
     }
+    async_query_interval: float = 0.1
+    
+    @classmethod
+    def from_task_wrapper(cls,wrapper:TaskWrapper) -> TaskStateMachine:
+        return cls(**wrapper)
     
     def __init__(
         self,
         machine_id: Hashable,
         task_map: TaskMap,
-        initial_dates: Dict[Hashable,Any],
+        initial_datas: Dict[str,Any],
         thread_pool: Optional[ThreadPoolExecutor] = None,
         process_pool: Optional[ProcessPoolExecutor] = None,
         progress: Optional[TaskProgressManager] = None,
         defualt_task_prameters: Optional[Dict[str,Any]] = None,
+        async_query_interval: Optional[float] = None,
     ):
         self.machine_id = machine_id
         self.task_map = task_map
-        self.datas = initial_dates
-        if defualt_task_prameters is None:
-            self.defualt_task_prameters = {**self.defualt_task_prameters, **self.defualt_task_prameters}
+        self.datas = initial_datas
+        if defualt_task_prameters is not None:
+            self.defualt_task_prameters = {**self.defualt_task_prameters, **defualt_task_prameters}
+        if async_query_interval is not None:
+            self.async_query_interval = async_query_interval
         self.open(thread_pool, process_pool, progress)
         
     def open(
@@ -613,20 +621,194 @@ class TaskStateMachine():
                             if task.State == NOT_BEGIN:
                                 nursery.start_soon(self.run_task_async, task)
                                 task.State = RUNNING
+            trio.sleep(self.async_query_interval)
         self.close()
         
-# test code
-import numpy as np
-def dot(x,y):
-    return np.dot(x,y)
-def norm_x(x):
-    return np.linalg.norm(x)
-def norm_y(y):
-    return np.linalg.norm(y)
-def cosine(d,nx,ny):
-    return np.dot(d,nx) / (nx*ny)
+class TaskWrapper(dict):
+    
+    def __init__(
+        self,
+        machine_id: Hashable,
+        task_map: TaskMap,
+        initial_datas: Dict[str,Any],
+        thread_pool: Optional[ThreadPoolExecutor] = None,
+        process_pool: Optional[ProcessPoolExecutor] = None,
+        progress: Optional[TaskProgressManager] = None,
+        defualt_task_prameters: Optional[Dict[str,Any]] = None,
+        async_query_interval: float = 0.1,
+        **kwargs,
+    ):
+        super().__init__(
+            machine_id=machine_id,
+            task_map=task_map,
+            initial_datas=initial_datas,
+            thread_pool=thread_pool,
+            process_pool=process_pool,
+            progress=progress,
+            defualt_task_prameters=defualt_task_prameters,
+            async_query_interval=async_query_interval,
+            **kwargs,
+        )
         
-if __name__ == '__main__':
+    @property
+    def MachineID(self) -> Hashable:
+        return self['machine_id']
+    
+    @MachineID.setter
+    def MachineID(self, value: Hashable):
+        self['machine_id'] = value
+        
+    @property
+    def TaskMap(self) -> TaskMap:
+        return self['task_map']
+    
+    @TaskMap.setter
+    def TaskMap(self, value: TaskMap):
+        self['task_map'] = value
+        
+    @property
+    def InitialDates(self) -> Dict[Hashable,Any]:
+        return self['initial_datas']
+    
+    @InitialDates.setter
+    def InitialDates(self, value: Dict[Hashable,Any]):
+        self['initial_datas'] = value
+        
+    @property
+    def ThreadPool(self) -> Optional[ThreadPoolExecutor]:
+        return self['thread_pool']
+    
+    @ThreadPool.setter
+    def ThreadPool(self, value: Optional[ThreadPoolExecutor]):
+        self['thread_pool'] = value
+        
+    @property
+    def ProcessPool(self) -> Optional[ProcessPoolExecutor]:
+        return self['process_pool']
+    
+    @ProcessPool.setter
+    def ProcessPool(self, value: Optional[ProcessPoolExecutor]):
+        self['process_pool'] = value
+        
+    @property
+    def Progress(self) -> Optional[TaskProgressManager]:
+        return self['progress']
+    
+    @Progress.setter
+    def Progress(self, value: Optional[TaskProgressManager]):
+        self['progress'] = value
+        
+    @property
+    def DefualtTaskPrameters(self) -> Optional[Dict[str,Any]]:
+        return self['defualt_task_prameters']
+    
+    @DefualtTaskPrameters.setter
+    def DefualtTaskPrameters(self, value: Optional[Dict[str,Any]]):
+        self['defualt_task_prameters'] = value
+        
+    @property
+    def AsyncQueryInterval(self) -> float:
+        return self['async_query_interval']
+    
+    @AsyncQueryInterval.setter
+    def AsyncQueryInterval(self, value: float):
+        self['async_query_interval'] = value
+        
+class TaskConfig():
+    
+    nodes: List[List[dict]] = None
+    initial_datas_requirements: FrozenSet[str] = None
+    defualt_task_prameters: Dict[str,Any] = None
+    async_query_interval: float = None
+    defualt_initial_datas: Dict[str,Any] = {}
+    
+    def __init__(
+        self,
+        nodes: Optional[List[List[dict]]] = None,
+        defualt_initial_datas: Optional[Dict[str,Any]] = None,
+    ) -> None:
+        if nodes is not None:
+            self.nodes = nodes
+        self.initial_datas_requirements = self.get_initial_datas_requirements()
+        if defualt_initial_datas is not None:
+            self.defualt_initial_datas = {**self.defualt_initial_datas, **defualt_initial_datas}
+            
+    def get_initial_datas_requirements(self) -> FrozenSet[str]:
+        if self.initial_datas_requirements is None:
+            initial_datas_requirements = set()
+            outputs = set()
+            for node in self.nodes:
+                for task in node:
+                    input_names = set(task['input_names'] if isinstance(task['input_names'], tuple) else (task['input_names'],))
+                    input_names = input_names - outputs
+                    initial_datas_requirements.update(input_names)
+                for task in node:
+                    output_names = set(task['output_names'] if isinstance(task['output_names'], tuple) else (task['output_names'],))
+                    outputs.update(output_names)
+            return frozenset(initial_datas_requirements)
+        else:
+            return self.initial_datas_requirements
+        
+    def requirements_check(self, initial_datas: Dict[str,Any]) -> None:
+        for key in self.initial_datas_requirements:
+            if key not in initial_datas:
+                if key in self.defualt_initial_datas:
+                    initial_datas[key] = self.defualt_initial_datas[key]
+                else:
+                    raise ValueError(f'TaskConfig: {self.__class__.__name__} requires initial data:{key} but it is not found in input dict: {list(initial_datas.keys())}')
+        
+    def get_task_wrapper(
+        self,
+        machine_id: Hashable,
+        initial_datas: Dict[str,Any],
+        progress: Optional[TaskProgressManager] = None,
+        thread_pool: Optional[ThreadPoolExecutor] = None,
+        process_pool: Optional[ProcessPoolExecutor] = None,
+        defualt_task_prameters: Optional[Dict[str,Any]] = None,
+        async_query_interval: Optional[float] = None,
+    ) -> TaskWrapper:
+        if async_query_interval is None:
+            async_query_interval = self.async_query_interval
+        if defualt_task_prameters is None:
+            defualt_task_prameters = self.defualt_task_prameters
+        self.requirements_check(initial_datas)
+        return TaskWrapper(
+            machine_id=machine_id,
+            task_map=TaskMap.from_list(self.nodes),
+            initial_datas=initial_datas,
+            progress=progress,
+            thread_pool=thread_pool,
+            process_pool=process_pool,
+            defualt_task_prameters=defualt_task_prameters,
+            async_query_interval=async_query_interval,
+        )
+                
+class TaskStateMachinePool():
+    
+    def __init__(
+        self,
+        task_wrappers: List[TaskWrapper]
+    ) -> None:
+        pass
+        
+# ------------------------------ Test ------------------------------
+
+import numpy as np
+
+class CosineTaskConfig(TaskConfig):
+    
+    def dot(x,y):
+        return np.dot(x,y)
+
+    def norm_x(x):
+        return np.linalg.norm(x)
+
+    def norm_y(y):
+        return np.linalg.norm(y)
+
+    def cosine(d,nx,ny):
+        return np.dot(d,nx) / (nx*ny)
+    
     task_dot = {
         'name': 'dot',
         'worker': dot,
@@ -666,23 +848,27 @@ if __name__ == '__main__':
         # 'worker_type': COROUTINE_WORKER,
         'use_progress': False,
     }
-    cosin_node = [
+    
+    nodes = [
         [task_dot, task_norm_x, task_norm_y],
         [task_cosine],
     ]
-    task_map = TaskMap.from_list(cosin_node)
+        
+if __name__ == '__main__':
+    cosine_task = CosineTaskConfig()
     with TaskProgressManager() as progress:
         with ThreadPoolExecutor() as thread_pool:
             with ProcessPoolExecutor() as process_pool:
-                machine = TaskStateMachine(
+                task_wrapper = cosine_task.get_task_wrapper(
                     machine_id='test',
-                    task_map=task_map,
-                    initial_dates={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
+                    initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
                     progress=progress,
                     thread_pool=thread_pool,
                     process_pool=process_pool,
+                    async_query_interval=0.1,
                 )
+                machine = TaskStateMachine(**task_wrapper)
                 # machine.start_serially()
                 trio.run(machine.start_asynchronously)
     print(machine.Datas)
-    task_map
+    print('Done.')
