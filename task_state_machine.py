@@ -984,7 +984,7 @@ def test_machine():
         with ThreadPoolExecutor() as thread_pool:
             with ProcessPoolExecutor() as process_pool:
                 task_wrapper = cosine_task.get_task_wrapper(
-                    machine_id=f'test_{i}',
+                    machine_id=f'test',
                     initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
                     progress=progress,
                     thread_pool=thread_pool,
