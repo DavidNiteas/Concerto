@@ -1,11 +1,12 @@
 from __future__ import annotations
 import trio
+import queue
 import inspect
 from rich.console import Console
 from rich.progress import Progress, ProgressColumn, GetTimeCallable, TaskID
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import warnings
-from typing import List, Dict, Tuple, Optional, Union, Literal, Hashable, Callable, Sequence, Any, FrozenSet
+from typing import List, Dict, Tuple, Optional, Union, Literal, Hashable, Callable, Sequence, Any, FrozenSet, Set
 
 # runtime state
 NOT_BEGIN = -1
@@ -370,6 +371,18 @@ class TaskProgressManager(Progress):
             refresh=refresh,
             **fields,
         )
+        
+    def update_total(
+        self,
+        task_name: Hashable,
+        advance: float = 1,
+        completed: Optional[float] = None,
+    ) -> None:
+        if task_name in self.Name2ID:
+            if completed is None:
+                self._tasks[self.Name2ID[task_name]].total += advance
+            else:
+                self._tasks[self.Name2ID[task_name]].total = completed
 
 class TaskStateMachine():
     
@@ -415,6 +428,9 @@ class TaskStateMachine():
         self.process_pool = process_pool
         self.progress = progress
         self.State = NOT_BEGIN
+        for task_group in self.TaskMap.nodes:
+            for task in task_group.Tasks.values():
+                self.add_task_to_progress(task)
         
     def close(self) -> None:
         self.thread_pool = None
@@ -456,6 +472,24 @@ class TaskStateMachine():
     @property
     def Progress(self) -> Optional[TaskProgressManager]:
         return self.progress
+    
+    def add_task_to_progress(
+        self,
+        task: Task,
+    ) -> None:
+        if self.Progress is not None:
+            if task.Name not in self.Progress.Name2ID:
+                self.Progress.add_task(task.Name,visible=task.UseProgress,total=1)
+            else:
+                self.Progress.update_total(task.Name)
+                
+    def update_task_progress(
+        self,
+        task: Task,
+        advance: float = 1,
+    ) -> None:
+        if self.Progress is not None:
+            self.Progress.update(task.Name, advance=advance, visible=task.UseProgress)
     
     # ↓↓↓↓↓ Synchronous Methods ↓↓↓↓↓
     
@@ -532,8 +566,6 @@ class TaskStateMachine():
         task.State = RUNNING
         try:
             self.init_task_parameters(task)
-            if task.Name not in self.Progress.Name2ID:
-                self.Progress.add_task(task.Name,visible=task.UseProgress)
             input_dict = self.init_worker_input(task)
             worker_output = self.start_worker(task, input_dict)
             self.update_machine_data(worker_output, task)
@@ -543,7 +575,7 @@ class TaskStateMachine():
                 warnings.warn(f'Task:{task.Name} in Machine:{self.ID} failed with error:{e}')
             else:
                 raise e
-        self.Progress.update(task.Name, advance=1, visible=task.UseProgress)
+        self.update_task_progress(task)
         task.State = END
 
     def start_serially(self):
@@ -592,8 +624,6 @@ class TaskStateMachine():
         task.State = RUNNING
         try:
             self.init_task_parameters(task)
-            if task.Name not in self.Progress.Name2ID:
-                self.Progress.add_task(task.Name, visible=task.UseProgress)
             input_dict = self.init_worker_input(task)
             worker_output = await self.start_worker_async(task, input_dict)
             self.update_machine_data(worker_output, task)
@@ -603,7 +633,7 @@ class TaskStateMachine():
                 warnings.warn(f'Task:{task.Name} in Machine:{self.ID} failed with error:{e}')
             else:
                 raise e
-        self.Progress.update(task.Name, advance=1, visible=task.UseProgress)
+        self.update_task_progress(task)
         task.State = END
         
     async def start_asynchronously(self):
@@ -787,9 +817,103 @@ class TaskStateMachinePool():
     
     def __init__(
         self,
-        task_wrappers: List[TaskWrapper]
+        task_wrappers: Optional[List[TaskWrapper]] = None,
+        thread_num: int = 0,
+        process_num: int = 0,
+        max_running_machines: int = 0,
+        auto_close: bool = True, # close itself when all tasks are done
+        progress: Union[TaskProgressManager,bool] = True,
     ) -> None:
+        self.thread_num = thread_num
+        self.process_num = process_num
+        self.max_running_machines = max_running_machines
+        self.auto_close = auto_close
+        
+        if progress is True:
+            self.progress = TaskProgressManager()
+        elif progress is False:
+            self.progress = None
+        else:
+            self.progress = progress
+            
+        self.input_queue = queue.Queue()
+        for task_wrapper in task_wrappers:
+            self.input_queue.put(task_wrapper)
+        self.output_queue = queue.Queue()
+        self.init_workers()
+        
+        self.all_machines = {}
+        self.running_machines = set()
+        self.done_machines = set()
+        self.waiting_machines = set()
+        
+    def init_workers(self):
+        if self.thread_num > 0:
+            self.thread_pool = ThreadPoolExecutor(max_workers=self.thread_num)
+        elif self.thread_num < 0:
+            self.thread_pool = ThreadPoolExecutor()
+        else:
+            self.thread_pool = None
+        if self.process_num > 0:
+            self.process_pool = ProcessPoolExecutor(max_workers=self.process_num)
+        elif self.process_num < 0:
+            self.process_pool = ProcessPoolExecutor()
+        else:
+            self.process_pool = None
+            
+    def shut_down_workers(self):
+        if self.thread_pool is not None:
+            self.thread_pool.shutdown(wait=True)
+        if self.process_pool is not None:
+            self.process_pool.shutdown(wait=True)
+            
+    @property
+    def AllMachines(self) -> Dict[Hashable,TaskStateMachine]:
+        return self.all_machines
+    
+    @property
+    def InputQueue(self) -> queue.Queue:
+        return self.input_queue
+    
+    @property
+    def OutputQueue(self) -> queue.Queue:
+        return self.output_queue
+    
+    @property
+    def RunningMachines(self) -> Set[TaskStateMachine]:
+        return self.running_machines
+    
+    @property
+    def DoneMachines(self) -> Set[TaskStateMachine]:
+        return self.done_machines
+    
+    @property
+    def WaitingMachines(self) -> Set[TaskStateMachine]:
+        return self.waiting_machines
+    
+    @property
+    def Progress(self) -> Optional[TaskProgressManager]:
+        return self.progress
+        
+    def open(self):
+        self.init_workers()
+
+    def close(self):
+        self.shut_down_workers()
+        
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        
+    def __len__(self):
+        return len(self.all_machines)
+    
+    def get_machine_from_queue(self) -> Optional[TaskStateMachine]:
         pass
+        
         
 # ------------------------------ Test ------------------------------
 
@@ -817,7 +941,7 @@ class CosineTaskConfig(TaskConfig):
         'task_type': MAIN_TASK,
         'worker_type': COROUTINE_WORKER,
         'cache_vars': ('x','y','d'),
-        'use_progress': False,
+        'use_progress': True,
     }
     task_norm_x = {
         'name': 'norm_x',
@@ -827,7 +951,7 @@ class CosineTaskConfig(TaskConfig):
         'task_type': MAIN_TASK,
         'worker_type': THREAD_WORKER,
         'cache_vars': ('x','nx'),
-        'use_progress': False,
+        'use_progress': True,
     }
     task_norm_y = {
         'name': 'norm_y',
@@ -837,7 +961,7 @@ class CosineTaskConfig(TaskConfig):
         'task_type': MAIN_TASK,
         'worker_type': PROCESS_WORKER,
         'cache_vars': ('y','ny'),
-        'use_progress': False,
+        'use_progress': True,
     }
     task_cosine = {
         'name': 'cosine',
@@ -846,21 +970,21 @@ class CosineTaskConfig(TaskConfig):
         'output_names': 'cos',
         # 'task_type': MAIN_TASK,
         # 'worker_type': COROUTINE_WORKER,
-        'use_progress': False,
+        'use_progress': True,
     }
     
     nodes = [
         [task_dot, task_norm_x, task_norm_y],
         [task_cosine],
     ]
-        
-if __name__ == '__main__':
+    
+def test_machine():
     cosine_task = CosineTaskConfig()
     with TaskProgressManager() as progress:
         with ThreadPoolExecutor() as thread_pool:
             with ProcessPoolExecutor() as process_pool:
                 task_wrapper = cosine_task.get_task_wrapper(
-                    machine_id='test',
+                    machine_id=f'test_{i}',
                     initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
                     progress=progress,
                     thread_pool=thread_pool,
@@ -872,3 +996,26 @@ if __name__ == '__main__':
                 trio.run(machine.start_asynchronously)
     print(machine.Datas)
     print('Done.')
+    
+async def test_machine_multi():
+    cosine_task = CosineTaskConfig()
+    with TaskProgressManager() as progress:
+        with ThreadPoolExecutor() as thread_pool:
+            with ProcessPoolExecutor() as process_pool:
+                async with trio.open_nursery() as nursery:
+                    for i in range(10000):
+                        task_wrapper = cosine_task.get_task_wrapper(
+                            machine_id=f'test_{i}',
+                            initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
+                            progress=progress,
+                            thread_pool=thread_pool,
+                            process_pool=process_pool,
+                            async_query_interval=0.1,
+                        )
+                        machine = TaskStateMachine(**task_wrapper)
+                        nursery.start_soon(machine.start_asynchronously)
+    print(machine.Datas)
+    print('Done.')
+    
+if __name__ == '__main__':
+    trio.run(test_machine_multi)
