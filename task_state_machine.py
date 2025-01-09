@@ -2,6 +2,10 @@ from __future__ import annotations
 import trio
 import queue
 import inspect
+import uuid
+import threading
+import time
+from dataclasses import dataclass
 from rich.console import Console
 from rich.progress import Progress, ProgressColumn, GetTimeCallable, TaskID
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -124,6 +128,7 @@ class BaseTask:
     def CacheVars(self) -> Optional[Tuple[str,...]]:
         return self.Datas.cache_vars
     
+@dataclass    
 class AbstractTask(BaseTask):
     
     name = None
@@ -445,9 +450,26 @@ class TaskProgressManager(Progress):
     ) -> None:
         if task_name in self.Name2ID:
             if completed is None:
-                self._tasks[self.Name2ID[task_name]].total += advance
+                if self._tasks[self.Name2ID[task_name]].total is None:
+                    self._tasks[self.Name2ID[task_name]].total = advance
+                else:
+                    self._tasks[self.Name2ID[task_name]].total += advance
             else:
                 self._tasks[self.Name2ID[task_name]].total = completed
+                
+class FakeTaskProgressManager():
+    
+    def __init__(self):
+        pass
+    
+    def add_task(self, *args, **kwargs):
+        pass
+    
+    def update(self, *args, **kwargs):
+        pass
+    
+    def update_total(self, *args, **kwargs):
+        pass
 
 class TaskStateMachine():
     
@@ -926,8 +948,8 @@ class TaskConfig():
         
     def get_task_wrapper(
         self,
-        machine_id: Hashable,
         initial_datas: Dict[str,Any],
+        machine_id: Optional[Hashable] = None,
         progress: Optional[TaskProgressManager] = None,
         thread_pool: Optional[ThreadPoolExecutor] = None,
         process_pool: Optional[ProcessPoolExecutor] = None,
@@ -960,22 +982,27 @@ class TaskStateMachinePool():
         max_running_machines: int = 0,
         auto_close: bool = True, # close itself when all tasks are done
         progress: Union[TaskProgressManager,bool] = True,
+        monitor_interval: float = 0.1,
     ) -> None:
         self.thread_num = thread_num
         self.process_num = process_num
         self.max_running_machines = max_running_machines
         self.auto_close = auto_close
+        self.monitor_interval = monitor_interval
         
         if progress is True:
             self.progress = TaskProgressManager()
         elif progress is False:
-            self.progress = None
+            self.progress = FakeTaskProgressManager()
         else:
             self.progress = progress
             
         self.input_queue = queue.Queue()
-        for task_wrapper in task_wrappers:
-            self.input_queue.put(task_wrapper)
+        for i,task_wrapper in enumerate(task_wrappers):
+            if isinstance(task_wrapper, TaskWrapper):
+                if task_wrapper.MachineID is None:
+                    task_wrapper.MachineID = i
+                self.input_queue.put(task_wrapper)
         self.output_queue = queue.Queue()
         self.init_workers()
         
@@ -983,6 +1010,11 @@ class TaskStateMachinePool():
         self.running_machines = set()
         self.done_machines = set()
         self.waiting_machines = set()
+        
+        #runtime variables
+        self.running = False
+        self.loadder_running = False
+        self.monitor_running = False
         
     def init_workers(self):
         if self.thread_num > 0:
@@ -1029,13 +1061,22 @@ class TaskStateMachinePool():
         return self.waiting_machines
     
     @property
-    def Progress(self) -> Optional[TaskProgressManager]:
+    def Progress(self) -> Union[TaskProgressManager,FakeTaskProgressManager]:
         return self.progress
+    
+    @property
+    def Running(self) -> bool:
+        return self.running
+    
+    def join(self):
+        while self.Running:
+            time.sleep(self.monitor_interval)
         
     def open(self):
         self.init_workers()
 
     def close(self):
+        self.join()
         self.shut_down_workers()
         
     def __enter__(self):
@@ -1048,10 +1089,84 @@ class TaskStateMachinePool():
     def __len__(self):
         return len(self.all_machines)
     
-    def get_machine_from_queue(self) -> Optional[TaskStateMachine]:
-        pass
+    def get_machine_from_queue(self) -> Union[TaskStateMachine,EndTask]:
+        if self.auto_close and self.input_queue.empty():
+            return EndTask()
+        wrapper = self.input_queue.get()
+        if isinstance(wrapper, TaskWrapper):
+            if wrapper.MachineID is None:
+                wrapper.MachineID = uuid.uuid4()
+            if wrapper.ThreadPool is None:
+                wrapper.ThreadPool = self.thread_pool
+            if wrapper.ProcessPool is None:
+                wrapper.ProcessPool = self.process_pool
+            if wrapper.Progress is None:
+                wrapper.Progress = self.progress
+            return TaskStateMachine(**wrapper)
+        elif isinstance(wrapper, EndTask):
+            return wrapper
+        else:
+            raise ValueError(f'The input of TaskStateMachinePool should be TaskWrapper or EndTask, but found {type(wrapper)}')
         
-        
+    def machine_loadder(self) -> None:
+        self.loadder_running = True
+        while self.loadder_running:
+            machine = self.get_machine_from_queue()
+            if isinstance(machine, EndTask):
+                self.loadder_running = False
+            else:
+                if machine.ID in self.all_machines:
+                    warnings.warn(f'Machine:{machine.ID} is already in this pool, we will use the old one')
+                else:
+                    self.all_machines[machine.ID] = machine
+                    self.WaitingMachines.add(machine.ID)
+                    self.Progress.update_total('Machines')
+    
+    def machine_monitor(self) -> None:
+        self.monitor_running = True
+        while self.monitor_running:
+            tag_mids = self.RunningMachines | self.WaitingMachines
+            if len(tag_mids) == 0 and not self.loadder_running:
+                self.monitor_running = False
+            for mid in tag_mids:
+                machine = self.AllMachines[mid]
+                if machine.State == NOT_BEGIN:
+                    if self.max_running_machines <= 0 or len(self.running_machines) < self.max_running_machines:
+                        self.RunningMachines.add(mid)
+                        self.WaitingMachines.remove(mid)
+                        machine.start_serially()
+                elif machine.State == END:
+                    self.DoneMachines.add(mid)
+                    self.RunningMachines.remove(mid)
+                    self.output_queue.put(machine)
+                    self.Progress.update('Machines',advance=1)
+            time.sleep(self.monitor_interval)
+        self.running = False
+    
+    def start_serially(self,by_thread:bool=False):
+        if self.running:
+            warnings.warn('TaskStateMachinePool is already running, we will not start it again')
+        else:
+            self.running = True
+            with self.progress:
+                self.progress.add_task('Machines')
+                if by_thread:
+                    loadder = threading.Thread(target=self.machine_loadder, daemon=True)
+                    monitor = threading.Thread(target=self.machine_monitor, daemon=True)
+                    loadder.start()
+                    monitor.start()
+                else:
+                    self.auto_close = True
+                    self.machine_loadder()
+                    self.machine_monitor()
+                    self.auto_close = False
+                    
+    def get_done_machines(self) -> List[TaskStateMachine]:
+        done_machines = []
+        while not self.output_queue.empty():
+            done_machines.append(self.output_queue.get())
+        return done_machines
+                  
 # ------------------------------ Test ------------------------------
 
 import numpy as np
@@ -1095,8 +1210,8 @@ def norm(data_dict: Dict[str,Any]) -> Dict[str,Any]:
 class NormTask(AbstractTask):
     
     name = 'norm'
-    # worker = staticmethod(norm)
-    worker = staticmethod(norm_async)
+    worker = staticmethod(norm)
+    # worker = staticmethod(norm_async)
     input_names = DICT
     output_names = DICT
     task_type = MAIN_TASK
@@ -1129,8 +1244,8 @@ def test_machine():
         with ThreadPoolExecutor() as thread_pool:
             with ProcessPoolExecutor() as process_pool:
                 task_wrapper = cosine_task.get_task_wrapper(
-                    machine_id=f'test',
                     initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
+                    machine_id=f'test',
                     progress=progress,
                     thread_pool=thread_pool,
                     process_pool=process_pool,
@@ -1150,8 +1265,8 @@ async def test_machine_multi():
                 async with trio.open_nursery() as nursery:
                     for i in range(10000):
                         task_wrapper = cosine_task.get_task_wrapper(
-                            machine_id=f'test_{i}',
                             initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
+                            machine_id=f'test_{i}',
                             progress=progress,
                             thread_pool=thread_pool,
                             process_pool=process_pool,
@@ -1162,6 +1277,24 @@ async def test_machine_multi():
     print(machine.Datas)
     print('Done.')
     
+def test_pool():
+    cosine_task = CosineTaskConfig()
+    task_wrappers = []
+    for i in range(5):
+        task_wrapper = cosine_task.get_task_wrapper(
+            initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
+        )
+        task_wrappers.append(task_wrapper)
+    pool = TaskStateMachinePool(
+        task_wrappers,
+    )
+    pool.open()
+    pool.start_serially(by_thread=False)
+    pool.close()
+    for machine in pool.get_done_machines():
+        print(machine.Datas)
+    
 if __name__ == '__main__':
-    trio.run(test_machine_multi)
+    # trio.run(test_machine_multi)
     # test_machine()
+    test_pool()
