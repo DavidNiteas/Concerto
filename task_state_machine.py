@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from rich.console import Console
-from rich.progress import Progress, ProgressColumn, GetTimeCallable, TaskID
+from rich.progress import Progress, ProgressColumn, GetTimeCallable, TaskID, track
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import warnings
 from typing import List, Dict, Tuple, Optional, Union, Literal, Hashable, Callable, Sequence, Any, FrozenSet, Set, Pattern
@@ -26,6 +26,21 @@ PROCESS_WORKER = 2
 # special i/o name
 DICT = 0
 NULL = 1
+
+def get_kv_pairs(item:Union[list,dict],use_progress:bool=False,**kwargs):
+    if isinstance(item,list):
+        if use_progress:
+            return enumerate(track(item,**kwargs))
+        else:
+            return enumerate(item)
+    else:
+        if use_progress:
+            return track(item.items(),**kwargs)
+        else:
+            return item.items()
+        
+def dict2list(d:Dict[int,Any]) -> List[Any]:
+    return [d[key] for key in sorted(d.keys())]
 
 class BaseTask:
     
@@ -470,6 +485,28 @@ class FakeTaskProgressManager():
     
     def update_total(self, *args, **kwargs):
         pass
+    
+    def start(self):
+        pass
+    
+    def stop(self):
+        pass
+    
+    def __enter__(self) -> FakeTaskProgressManager:
+        self.start()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        pass
+    
+class FakePool():
+    
+    def __enter__(self):
+        return None
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
 
 class TaskStateMachine():
     
@@ -713,7 +750,7 @@ class TaskStateMachine():
         
     # ↓↓↓↓↓ Asynchronous Methods ↓↓↓↓↓
     
-    async def init_worker_input_async(
+    async def init_worker_input_coroutine(
         self,
         task: Task,
     ) -> Tuple[
@@ -747,7 +784,7 @@ class TaskStateMachine():
                 raise ValueError(f'Task:{task.Name} has unknown input names type:{task.InputNames}')
         return args, kwargs
     
-    async def start_worker_async(
+    async def start_worker_coroutine(
         self,
         task: Task,
         args: Tuple[Any,...],
@@ -771,7 +808,7 @@ class TaskStateMachine():
         else:
             raise ValueError(f'Task:{task.Name} in Machine:{self.ID} has unknown worker type:{task.WorkerType}')
         
-    async def update_machine_data_async(
+    async def update_machine_data_coroutine(
         self,
         worker_output: Union[Tuple[Any,...],Dict[str,Any],Any,None],
         task: Task,
@@ -802,16 +839,16 @@ class TaskStateMachine():
         else:
             raise ValueError(f'Task:{task.Name} has unknown output names type:{task.OutputNames}')
 
-    async def run_task_async(
+    async def run_task_coroutine(
         self,
         task: Task,
     ) -> None:
         task.State = RUNNING
         try:
             self.init_task_parameters(task)
-            input_args, input_kwargs = await self.init_worker_input_async(task)
-            worker_output = await self.start_worker_async(task, input_args, input_kwargs)
-            await self.update_machine_data_async(worker_output, task)
+            input_args, input_kwargs = await self.init_worker_input_coroutine(task)
+            worker_output = await self.start_worker_coroutine(task, input_args, input_kwargs)
+            await self.update_machine_data_coroutine(worker_output, task)
         except Exception as e:
             if task.TaskType != MAIN_TASK:
                 task.Error = e
@@ -821,7 +858,7 @@ class TaskStateMachine():
         self.update_task_progress(task)
         task.State = END
  
-    async def start_asynchronously(self):
+    async def start_asynchronously_coroutine(self):
         self.State = RUNNING
         while self.State == RUNNING:
             task_group = next(self.task_map)
@@ -834,10 +871,67 @@ class TaskStateMachine():
                     async with trio.open_nursery() as nursery:
                         for task in task_group.Tasks.values():
                             if task.State == NOT_BEGIN:
-                                nursery.start_soon(self.run_task_async, task)
+                                nursery.start_soon(self.run_task_coroutine, task)
                                 task.State = RUNNING
-            trio.sleep(self.async_query_interval)
+            await trio.sleep(self.async_query_interval)
         self.close()
+        
+    def start_asynchronously(self):
+        trio.run(self.start_asynchronously_coroutine)
+        
+    @classmethod
+    async def start_multiple_machines_coroutine(
+        cls,
+        task_configs: Union[TaskConfig,List[TaskConfig],Dict[Hashable,TaskConfig]],
+        initial_data_list: Union[List[Dict[str,Any]],Dict[Hashable,Dict[str,Any]]],
+        thread: Union[int,ThreadPoolExecutor] = 0,
+        process: Union[int,ProcessPoolExecutor] = 0,
+        progress: Union[TaskProgressManager,bool] = True,
+    ) -> Union[List[TaskStateMachine],Dict[Hashable,TaskStateMachine]]:
+        if isinstance(progress,bool):
+            if progress:
+                progress = TaskProgressManager()
+            else:
+                progress = FakeTaskProgressManager()
+        if isinstance(thread,int):
+            if thread > 0:
+                thread = ThreadPoolExecutor(max_workers=thread)
+            else:
+                thread = FakePool()
+        else:
+            thread = thread
+        if isinstance(process,int):
+            if process > 0:
+                process = ProcessPoolExecutor(max_workers=process)
+            else:
+                process = FakePool()
+        else:
+            process = process
+        machines: Dict[Hashable,TaskStateMachine] = {}
+        with progress, thread, process:
+            async with trio.open_nursery() as nursery:
+                for machine_id,initial_data in get_kv_pairs(initial_data_list):
+                    task_config = task_configs[machine_id] if not isinstance(task_configs,TaskConfig) else task_configs
+                    task_wrapper = task_config.get_task_wrapper(
+                        initial_data,
+                        machine_id=machine_id,
+                        progress=progress,
+                        thread_pool=thread,
+                        process_pool=process,
+                    )
+                    machines[machine_id] = TaskStateMachine(**task_wrapper)
+                    nursery.start_soon(machines[machine_id].start_asynchronously_coroutine)
+        if isinstance(initial_data_list,list):
+            machines = dict2list(machines)
+        return machines
+    
+    @classmethod
+    def start_multiple_machines(
+        cls,
+        task_configs: Union[TaskConfig,List[TaskConfig],Dict[Hashable,TaskConfig]],
+        initial_data_list: Union[List[Dict[str,Any]],Dict[Hashable,Dict[str,Any]]],
+    ) -> Union[List[TaskStateMachine],Dict[Hashable,TaskStateMachine]]:
+        return trio.run(cls.start_multiple_machines_coroutine, task_configs, initial_data_list)
         
 class TaskWrapper(dict):
     
@@ -1074,10 +1168,12 @@ class TaskStateMachinePool():
         
     def open(self):
         self.init_workers()
+        self.Progress.start()
 
     def close(self):
         self.join()
         self.shut_down_workers()
+        self.Progress.stop()
         
     def __enter__(self):
         self.open()
@@ -1088,6 +1184,8 @@ class TaskStateMachinePool():
         
     def __len__(self):
         return len(self.all_machines)
+    
+    # ↓↓↓↓↓ Synchronous Methods ↓↓↓↓↓
     
     def get_machine_from_queue(self) -> Union[TaskStateMachine,EndTask]:
         if self.auto_close and self.input_queue.empty():
@@ -1108,7 +1206,7 @@ class TaskStateMachinePool():
         else:
             raise ValueError(f'The input of TaskStateMachinePool should be TaskWrapper or EndTask, but found {type(wrapper)}')
         
-    def machine_loadder(self) -> None:
+    def run_machine_loadder(self) -> None:
         self.loadder_running = True
         while self.loadder_running:
             machine = self.get_machine_from_queue()
@@ -1122,7 +1220,7 @@ class TaskStateMachinePool():
                     self.WaitingMachines.add(machine.ID)
                     self.Progress.update_total('Machines')
     
-    def machine_monitor(self) -> None:
+    def run_machine_monitor(self) -> None:
         self.monitor_running = True
         while self.monitor_running:
             tag_mids = self.RunningMachines | self.WaitingMachines
@@ -1142,31 +1240,107 @@ class TaskStateMachinePool():
                     self.Progress.update('Machines',advance=1)
             time.sleep(self.monitor_interval)
         self.running = False
-    
-    def start_serially(self,by_thread:bool=False):
+        
+    def start_serially(self) -> None:
         if self.running:
             warnings.warn('TaskStateMachinePool is already running, we will not start it again')
         else:
             self.running = True
-            with self.progress:
-                self.progress.add_task('Machines')
-                if by_thread:
-                    loadder = threading.Thread(target=self.machine_loadder, daemon=True)
-                    monitor = threading.Thread(target=self.machine_monitor, daemon=True)
-                    loadder.start()
-                    monitor.start()
-                else:
-                    self.auto_close = True
-                    self.machine_loadder()
-                    self.machine_monitor()
-                    self.auto_close = False
+            self.progress.add_task('Machines')
+            self.run_machine_loadder()
+            self.run_machine_monitor()
+            self.auto_close = False
+    
+    def start_serially_by_thread(
+        self,
+    ) -> Optional[Tuple[
+        threading.Thread, # loadder thread
+        threading.Thread, # monitor thread
+    ]]:
+        if self.running:
+            warnings.warn('TaskStateMachinePool is already running, we will not start it again')
+        else:
+            self.running = True
+            self.progress.add_task('Machines')
+            loadder = threading.Thread(target=self.run_machine_loadder, daemon=True)
+            monitor = threading.Thread(target=self.run_machine_monitor, daemon=True)
+            loadder.start()
+            monitor.start()
+            return loadder, monitor
                     
     def get_done_machines(self) -> List[TaskStateMachine]:
         done_machines = []
         while not self.output_queue.empty():
             done_machines.append(self.output_queue.get())
         return done_machines
-                  
+    
+    # ↓↓↓↓↓ Asynchronous Methods ↓↓↓↓↓
+    
+    async def run_machine_loadder_coroutine(self) -> None:
+        self.run_machine_loadder()
+        # self.loadder_running = True
+        # while self.loadder_running:
+        #     machine = self.get_machine_from_queue()
+        #     if isinstance(machine, EndTask):
+        #         self.loadder_running = False
+        #     else:
+        #         if machine.ID in self.all_machines:
+        #             warnings.warn(f'Machine:{machine.ID} is already in this pool, we will use the old one')
+        #         else:
+        #             self.all_machines[machine.ID] = machine
+        #             self.WaitingMachines.add(machine.ID)
+        #             self.Progress.update_total('Machines')
+                    
+    async def run_machine_monitor_coroutine(self) -> None:
+        self.monitor_running = True
+        async with trio.open_nursery() as nursery:
+            while self.monitor_running:
+                tag_mids = self.RunningMachines | self.WaitingMachines
+                if len(tag_mids) == 0 and not self.loadder_running:
+                    self.monitor_running = False
+                for mid in tag_mids:
+                    machine = self.AllMachines[mid]
+                    if machine.State == NOT_BEGIN:
+                        if self.max_running_machines <= 0 or len(self.running_machines) < self.max_running_machines:
+                            self.RunningMachines.add(mid)
+                            self.WaitingMachines.remove(mid)
+                            nursery.start_soon(machine.start_asynchronously_coroutine)
+                    elif machine.State == END:
+                        self.DoneMachines.add(mid)
+                        self.RunningMachines.remove(mid)
+                        self.output_queue.put(machine)
+                        self.Progress.update('Machines',advance=1)
+                await trio.sleep(self.monitor_interval)
+        self.running = False
+        
+    def run_machine_monitor_async(self) -> None:
+        trio.run(self.run_machine_monitor_coroutine)
+        
+    async def start_asynchronously_coroutine(self) -> None:
+        if self.running:
+            warnings.warn('TaskStateMachinePool is already running, we will not start it again')
+        else:
+            self.running = True
+            self.progress.add_task('Machines')
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(self.run_machine_loadder_coroutine)
+                nursery.start_soon(self.run_machine_monitor_coroutine)
+                
+    def start_asynchronously(self) -> None:
+        trio.run(self.start_asynchronously_coroutine)
+                    
+    def start_asynchronously_by_thread(self) -> Optional[Tuple[threading.Thread,threading.Thread]]:
+        if self.running:
+            warnings.warn('TaskStateMachinePool is already running, we will not start it again')
+        else:
+            self.running = True
+            self.progress.add_task('Machines')
+            loadder = threading.Thread(target=self.run_machine_loadder, daemon=True)
+            monitor = threading.Thread(target=self.run_machine_monitor_async, daemon=True)
+            loadder.start()
+            monitor.start()
+            return loadder, monitor
+        
 # ------------------------------ Test ------------------------------
 
 import numpy as np
@@ -1280,7 +1454,7 @@ async def test_machine_multi():
 def test_pool():
     cosine_task = CosineTaskConfig()
     task_wrappers = []
-    for i in range(5):
+    for i in range(10000):
         task_wrapper = cosine_task.get_task_wrapper(
             initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
         )
@@ -1289,12 +1463,33 @@ def test_pool():
         task_wrappers,
     )
     pool.open()
-    pool.start_serially(by_thread=False)
+    # pool.start_serially(by_thread=False)
+    pool.start_asynchronously_by_thread()
     pool.close()
     for machine in pool.get_done_machines():
-        print(machine.Datas)
+        pass
+    print(machine.Datas)
+        
+async def test_pool_async():
+    cosine_task = CosineTaskConfig()
+    task_wrappers = []
+    for i in range(10000):
+        task_wrapper = cosine_task.get_task_wrapper(
+            initial_datas={'x':np.array([1,2,3]), 'y':np.array([4,5,6])},
+        )
+        task_wrappers.append(task_wrapper)
+    pool = TaskStateMachinePool(
+        task_wrappers,
+    )
+    pool.open()
+    await pool.start_asynchronously_coroutine()
+    pool.close()
+    for machine in pool.get_done_machines():
+        pass
+    print(machine.Datas)
     
 if __name__ == '__main__':
     # trio.run(test_machine_multi)
     # test_machine()
     test_pool()
+    # trio.run(test_pool_async)
