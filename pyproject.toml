@@ -1,0 +1,23 @@
+[project]
+name = "concerto"
+version = "0.1.0"
+description = "Concerto is a lightweight library for asynchronous and parallel functions, aiming to assist developers in quickly writing asynchronous and parallel processes for their software."
+authors = [
+    {name = "David.Niteas",email = "david.ql.d@foxmail.com"}
+]
+license = {text = "The MIT License (MIT)"}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "trio (>=0.28.0,<0.29.0)",
+    "curio (>=1.6,<2.0)",
+    "asyncio (>=3.4.3,<4.0.0)",
+    "nest-asyncio (>=1.6.0,<2.0.0)",
+    "rich (>=13.9.4,<14.0.0)",
+    "uuid (>=1.30,<2.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
