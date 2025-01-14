@@ -78,16 +78,20 @@ def run_coroutine(
     data_dict: Optional[Dict[Hashable,Dict[int,Any]]] = None,
     backend: Union[
         Literal['trio','curio','asyncio'],
-        Tuple[Literal['trio','curio','asyncio'],Callable[
-            [
-                Callable,
-                Union[
-                    Dict[Hashable, Tuple[tuple,dict]],
-                    List[Tuple[tuple,dict]],
+        Tuple[
+            Literal['trio','curio','asyncio'],
+            Callable[
+                [
+                    Callable,
+                    Union[
+                        Dict[Hashable, Tuple[tuple,dict]],
+                        List[Tuple[tuple,dict]],
+                    ],
+                    Dict[Hashable,Any],
                 ],
-                Dict[Hashable,Any],
+                None,
             ]
-        ]],
+            ],
     ] = 'trio',
     progress: Union[ProgressManager,bool] = True,
     description: str = None,
